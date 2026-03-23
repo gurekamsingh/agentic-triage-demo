@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """
 agent/triage.py — Agentic bug triage using Claude tool-use loop.
+Reads new GitHub issues, labels them, finds the relevant lines of code,
+and posts a comment with a direct link to the buggy code.
 """
 
 import json
@@ -15,6 +17,10 @@ client = anthropic.Anthropic()
 ISSUE_NUMBER = int(os.environ["ISSUE_NUMBER"])
 ISSUE_TITLE  = os.environ.get("ISSUE_TITLE", "")
 ISSUE_BODY   = os.environ.get("ISSUE_BODY", "")
+
+# ---------------------------------------------------------------------------
+# Tool definitions
+# ---------------------------------------------------------------------------
 
 TOOLS = [
     {
@@ -34,7 +40,7 @@ TOOLS = [
         "input_schema": {
             "type": "object",
             "properties": {
-                "body": {"type": "string"}
+                "body": {"type": "string", "description": "Markdown content. Include code permalinks where relevant."}
             },
             "required": ["body"],
         },
@@ -52,16 +58,39 @@ TOOLS = [
     },
     {
         "name": "get_file_contents",
-        "description": "Read a file from the repository to understand context.",
+        "description": "Read a file from the repository with line numbers so you can identify the exact lines responsible for a bug.",
         "input_schema": {
             "type": "object",
             "properties": {
-                "path": {"type": "string"}
+                "path": {"type": "string", "description": "Relative file path, e.g. tasks-api/main.py"}
             },
             "required": ["path"],
         },
     },
+    {
+        "name": "link_to_code",
+        "description": "Generate a GitHub permalink to specific lines in a file. Use this after get_file_contents identifies the buggy lines.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "path":       {"type": "string",  "description": "Relative file path, e.g. tasks-api/main.py"},
+                "start_line": {"type": "integer", "description": "First line of the buggy code"},
+                "end_line":   {"type": "integer", "description": "Last line of the buggy code"}
+            },
+            "required": ["path", "start_line", "end_line"],
+        },
+    },
 ]
+
+# ---------------------------------------------------------------------------
+# Tool execution
+# ---------------------------------------------------------------------------
+
+def get_default_branch() -> str:
+    try:
+        return repo.default_branch
+    except Exception:
+        return "main"
 
 
 def execute_tool(name: str, args: dict) -> str:
@@ -93,26 +122,52 @@ def execute_tool(name: str, args: dict) -> str:
     elif name == "get_file_contents":
         try:
             contents = repo.get_contents(args["path"])
-            return contents.decoded_content.decode("utf-8")[:3000]
+            raw = contents.decoded_content.decode("utf-8")
+            # Return with line numbers so the agent can pinpoint lines
+            numbered = "\n".join(
+                f"{i+1:4d} | {line}"
+                for i, line in enumerate(raw.splitlines())
+            )
+            return numbered[:4000]
         except Exception as e:
             return f"Could not read file: {e}"
+
+    elif name == "link_to_code":
+        branch = get_default_branch()
+        path   = args["path"]
+        start  = args["start_line"]
+        end    = args["end_line"]
+        url = (
+            f"https://github.com/{os.environ['REPO_NAME']}"
+            f"/blob/{branch}/{path}#L{start}-L{end}"
+        )
+        return url
 
     return f"Unknown tool: {name}"
 
 
+# ---------------------------------------------------------------------------
+# Agent loop
+# ---------------------------------------------------------------------------
+
 def run_agent():
     system_prompt = """You are a senior engineer triaging GitHub issues for a FastAPI task manager app.
 
-Steps:
-1. Search for duplicates first.
-2. Read the relevant source file if needed to understand the bug.
-3. Add the appropriate label: bug, enhancement, question, needs-info, security, duplicate, or wontfix.
-4. Post a concise, helpful comment:
-   - For bugs: acknowledge it, ask for repro steps / Python version / OS if not provided.
-   - For features: acknowledge and note it will be reviewed.
-   - For security issues: label as 'security', post a generic acknowledgement only — no public repro steps.
-   - For duplicates: link to the original issue.
-5. Stop once you have labelled and commented."""
+The source code is in tasks-api/main.py.
+
+Your steps for every issue:
+1. Search for duplicates first — if found, label 'duplicate' and link to the original.
+2. Read tasks-api/main.py using get_file_contents to find the lines responsible for the bug.
+3. Use link_to_code to generate a permalink to those exact lines.
+4. Add the appropriate label: bug, enhancement, question, needs-info, security, duplicate, or wontfix.
+5. Post a comment that:
+   - Briefly explains what the bug is and why it happens
+   - Includes the code permalink so the reporter can see the exact problem
+   - Suggests a concrete fix in 1-2 sentences
+   - For security issues: keep it generic, no repro steps, no code details in the public comment
+   - For feature requests: acknowledge and note it will be reviewed, no code link needed
+
+Be concise and technical. Stop once you have labelled and commented."""
 
     messages = [
         {
@@ -123,7 +178,7 @@ Steps:
 
     print(f"[agent] Triaging issue #{ISSUE_NUMBER}: {ISSUE_TITLE}")
 
-    for i in range(10):
+    for i in range(15):
         response = client.messages.create(
             model="claude-sonnet-4-20250514",
             max_tokens=1024,
@@ -146,7 +201,7 @@ Steps:
                     continue
                 print(f"[agent] → {block.name}({json.dumps(block.input)})")
                 result = execute_tool(block.name, block.input)
-                print(f"[agent] ← {result[:150]}")
+                print(f"[agent] ← {result[:200]}")
                 tool_results.append({
                     "type": "tool_result",
                     "tool_use_id": block.id,
