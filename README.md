@@ -45,6 +45,11 @@ Just open an issue. The agent handles the rest.
 
 Check the **Actions tab** in your repo to watch the agent's reasoning in real time.
 
+Finally you will see a comment under the issue pointing out to exact issue in the code:
+
+<img width="1549" height="874" alt="image" src="https://github.com/user-attachments/assets/db468879-985f-44f8-a50a-a3b2d97ed331" />
+
+
 ---
 
 ## Project structure
